@@ -1,0 +1,4 @@
+kafka-python==2.0.2
+faker==19.13.0
+pyspark==3.5.0
+delta-spark==3.0.0
