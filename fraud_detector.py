@@ -22,9 +22,11 @@ Requires Kafka on localhost:9092 and delta-spark installed.
 import os
 
 from delta import configure_spark_with_delta_pip
+from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
+    BooleanType,
     DoubleType,
     IntegerType,
     StringType,
@@ -41,7 +43,13 @@ GOLD_PATH       = f"{BASE_PATH}/delta/gold"
 CHECKPOINT_BASE = f"{BASE_PATH}/checkpoints"
 
 # ── Kafka ──────────────────────────────────────────────────────────────────────
-KAFKA_BOOTSTRAP      = "localhost:9092"
+KAFKA_BOOTSTRAP      = "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+CONFLUENT_API_KEY    = os.environ["CONFLUENT_API_KEY"]
+CONFLUENT_API_SECRET = os.environ["CONFLUENT_API_SECRET"]
+SASL_JAAS_CONFIG     = (
+    "org.apache.kafka.common.security.plain.PlainLoginModule required "
+    f'username="{CONFLUENT_API_KEY}" password="{CONFLUENT_API_SECRET}";'
+)
 TOPIC_IMPRESSIONS    = "ad-impressions"
 TOPIC_CLICKS         = "ad-clicks"
 TOPIC_CONVERSIONS    = "ad-conversions"
@@ -92,6 +100,22 @@ CONVERSION_SCHEMA = StructType([
     StructField("fraud_label",     StringType(),    True),
 ])
 
+SILVER_CLICK_SCHEMA = StructType([
+    StructField("event_id",                 StringType(),    False),
+    StructField("impression_id",            StringType(),    True),
+    StructField("user_id",                  StringType(),    True),
+    StructField("campaign_id",              StringType(),    True),
+    StructField("ip_address",               StringType(),    True),
+    StructField("user_agent",               StringType(),    True),
+    StructField("time_since_impression_ms", IntegerType(),   True),
+    StructField("timestamp",                TimestampType(), True),
+    StructField("fraud_label",              StringType(),    True),
+    StructField("is_click_flood",           BooleanType(),   True),
+    StructField("is_bot_ip",                BooleanType(),   True),
+    StructField("is_instant_click",         BooleanType(),   True),
+    StructField("is_fraud",                 BooleanType(),   True),
+])
+
 
 # ── Spark session ──────────────────────────────────────────────────────────────
 
@@ -105,7 +129,10 @@ def build_spark() -> SparkSession:
         .config("spark.sql.shuffle.partitions", "4")           # Keep low for local dev
         .config("spark.databricks.delta.retentionDurationCheck.enabled", "false")
     )
-    return configure_spark_with_delta_pip(builder).getOrCreate()
+    return configure_spark_with_delta_pip(
+        builder,
+        extra_packages=["org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0"],
+    ).getOrCreate()
 
 
 # ── Kafka reader ───────────────────────────────────────────────────────────────
@@ -119,8 +146,11 @@ def read_kafka(spark: SparkSession, topic: str, schema: StructType):
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("kafka.security.protocol", "SASL_SSL")
+        .option("kafka.sasl.mechanism", "PLAIN")
+        .option("kafka.sasl.jaas.config", SASL_JAAS_CONFIG)
         .option("subscribe", topic)
-        .option("startingOffsets", "latest")
+        .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "false")
         .load()
         # 'value' is binary — cast to string then parse as JSON
@@ -157,104 +187,58 @@ def write_bronze(df, topic_name: str):
 
 # ── Silver layer — Clicks ──────────────────────────────────────────────────────
 
-def build_silver_clicks(clicks_df):
+def write_silver_clicks(clicks_df):
     """
-    Apply fraud detection rules to the click stream:
-
-      Rule 1 — Click Flooding  : > 50 clicks per user in a 10-min tumbling window
-      Rule 2 — Bot IP Traffic  : > 20 distinct campaigns per IP in a 10-min window
-      Rule 3 — Instant Click   : time_since_impression_ms < 200
-
-    Output columns added:
-      is_click_flood   BOOLEAN
-      is_bot_ip        BOOLEAN
-      is_instant_click BOOLEAN
-      is_fraud         BOOLEAN  (any rule triggered)
+    Applies Rules 1-3 per micro-batch via foreachBatch, avoiding the stream-stream
+    LEFT OUTER join restriction (which requires a time-range condition).
+    Within each static batch, regular DataFrame joins are used.
     """
-
-    # Rule 1 — click flooding: count clicks per user per 10-min window
-    user_click_counts = (
-        clicks_df
-        .groupBy(
-            F.window("timestamp", "10 minutes"),
-            "user_id"
-        )
-        .agg(F.count("event_id").alias("click_count"))
-        .select(
-            "user_id",
-            F.col("window.start").alias("window_start"),
-            "click_count",
-            (F.col("click_count") > FLOOD_CLICK_THRESHOLD).alias("is_flood_user"),
-        )
-    )
-
-    # Rule 2 — bot IP: count distinct campaigns per IP per 10-min window
-    ip_campaign_counts = (
-        clicks_df
-        .groupBy(
-            F.window("timestamp", "10 minutes"),
-            "ip_address"
-        )
-        .agg(F.countDistinct("campaign_id").alias("distinct_campaigns"))
-        .select(
-            "ip_address",
-            F.col("window.start").alias("window_start"),
-            "distinct_campaigns",
-            (F.col("distinct_campaigns") > BOT_IP_CAMPAIGN_THRESHOLD).alias("is_bot_ip"),
-        )
-    )
-
-    # Join fraud flags back onto individual click events
-    enriched = (
-        clicks_df
-        .join(
-            user_click_counts,
-            on="user_id",
-            how="left",
-        )
-        .join(
-            ip_campaign_counts,
-            on="ip_address",
-            how="left",
-        )
-        .withColumn(
-            "is_click_flood",
-            F.coalesce(F.col("is_flood_user"), F.lit(False))
-        )
-        .withColumn(
-            "is_bot_ip",
-            F.coalesce(F.col("is_bot_ip"), F.lit(False))
-        )
-        .withColumn(
-            "is_instant_click",
-            F.col("time_since_impression_ms") < INSTANT_CLICK_THRESHOLD_MS
-        )
-        .withColumn(
-            "is_fraud",
-            F.col("is_click_flood") | F.col("is_bot_ip") | F.col("is_instant_click")
-        )
-        .select(
-            "event_id", "impression_id", "user_id", "campaign_id",
-            "ip_address", "user_agent", "time_since_impression_ms",
-            "timestamp", "fraud_label",
-            "is_click_flood", "is_bot_ip", "is_instant_click", "is_fraud",
-        )
-    )
-
-    return enriched
-
-
-def write_silver_clicks(silver_df):
     path       = f"{SILVER_PATH}/clicks"
     checkpoint = f"{CHECKPOINT_BASE}/silver/clicks"
     os.makedirs(path, exist_ok=True)
 
+    def _process(batch_df, _batch_id):
+        if batch_df.rdd.isEmpty():
+            return
+
+        # Rule 1: click flooding — clicks per user in this micro-batch
+        user_counts = (
+            batch_df.groupBy("user_id")
+            .agg(F.count("event_id").alias("click_count"))
+        )
+
+        # Rule 2: bot IP — distinct campaigns per IP in this micro-batch
+        ip_counts = (
+            batch_df.groupBy("ip_address")
+            .agg(F.countDistinct("campaign_id").alias("distinct_campaigns"))
+        )
+
+        result = (
+            batch_df
+            .join(user_counts, "user_id", "left")
+            .join(ip_counts, "ip_address", "left")
+            .withColumn("is_click_flood",
+                        F.col("click_count") > FLOOD_CLICK_THRESHOLD)
+            .withColumn("is_bot_ip",
+                        F.col("distinct_campaigns") > BOT_IP_CAMPAIGN_THRESHOLD)
+            .withColumn("is_instant_click",
+                        F.col("time_since_impression_ms") < INSTANT_CLICK_THRESHOLD_MS)
+            .withColumn("is_fraud",
+                        F.col("is_click_flood") | F.col("is_bot_ip") | F.col("is_instant_click"))
+            .select(
+                "event_id", "impression_id", "user_id", "campaign_id",
+                "ip_address", "user_agent", "time_since_impression_ms",
+                "timestamp", "fraud_label",
+                "is_click_flood", "is_bot_ip", "is_instant_click", "is_fraud",
+            )
+        )
+
+        result.write.format("delta").mode("append").save(path)
+
     return (
-        silver_df.writeStream
-        .format("delta")
-        .outputMode("append")
+        clicks_df.writeStream
+        .foreachBatch(_process)
         .option("checkpointLocation", checkpoint)
-        .option("path", path)
         .trigger(processingTime="15 seconds")
         .start()
     )
@@ -272,25 +256,46 @@ def detect_orphan_conversions(clicks_df, conversions_df):
     Spark maintains state for both streams within the watermark window.
     """
 
+    # Keep 'timestamp' name so the watermark from clicks_df is inherited (no redefinition).
+    # A sentinel column lets us detect non-matches after the LEFT OUTER join.
     clicks_keyed = clicks_df.select(
         F.col("event_id").alias("click_id"),
-        F.col("timestamp").alias("click_timestamp"),
+        F.col("timestamp"),
+        F.lit(True).alias("click_found"),
     )
 
+    # Time-range condition is required by Spark for LEFT OUTER stream-stream joins
     joined = (
         conversions_df
         .join(
             clicks_keyed,
-            on="click_id",
+            on=(
+                (conversions_df.click_id == clicks_keyed.click_id) &
+                (conversions_df.timestamp >= clicks_keyed.timestamp - F.expr("INTERVAL 30 MINUTES")) &
+                (conversions_df.timestamp <= clicks_keyed.timestamp + F.expr("INTERVAL 30 MINUTES"))
+            ),
             how="left",
         )
         .withColumn(
             "is_orphan_conversion",
-            F.col("click_timestamp").isNull()
+            F.col("click_found").isNull()   # null when no matching click was found
         )
         .withColumn(
             "is_fraud",
             F.col("is_orphan_conversion")
+        )
+        .select(
+            conversions_df.event_id,
+            conversions_df.click_id,
+            conversions_df.impression_id,
+            conversions_df.user_id,
+            conversions_df.campaign_id,
+            conversions_df.conversion_type,
+            conversions_df.revenue_usd,
+            conversions_df.timestamp,
+            conversions_df.fraud_label,
+            "is_orphan_conversion",
+            "is_fraud",
         )
     )
 
@@ -396,15 +401,29 @@ def main():
     q_bronze_conv = write_bronze(conversions_df,  "conversions")
 
     # ── Silver — fraud-flagged clicks ─────────────────────────────────────────
-    silver_clicks_df    = build_silver_clicks(clicks_df)
-    q_silver_clicks     = write_silver_clicks(silver_clicks_df)
+    # Pre-create the Delta table so the gold readStream can start immediately
+    silver_clicks_path = f"{SILVER_PATH}/clicks"
+    os.makedirs(silver_clicks_path, exist_ok=True)
+    DeltaTable.createIfNotExists(spark) \
+        .location(silver_clicks_path) \
+        .addColumns(SILVER_CLICK_SCHEMA) \
+        .execute()
+
+    q_silver_clicks     = write_silver_clicks(clicks_df)
 
     # ── Silver — orphan conversions ───────────────────────────────────────────
     silver_conv_df      = detect_orphan_conversions(clicks_df, conversions_df)
     q_silver_conv       = write_silver_conversions(silver_conv_df)
 
     # ── Gold — fraud alert aggregations ──────────────────────────────────────
-    gold_df             = build_gold_fraud_alerts(silver_clicks_df)
+    # Read from the silver Delta table (written by foreachBatch above)
+    silver_for_gold = (
+        spark.readStream
+        .format("delta")
+        .load(silver_clicks_path)
+        .withWatermark("timestamp", "10 minutes")
+    )
+    gold_df             = build_gold_fraud_alerts(silver_for_gold)
     q_gold              = write_gold_alerts(gold_df)
 
     print("[Consumer] All streaming queries started. Waiting for data …\n")

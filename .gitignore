@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+
+# Spark / Delta Lake local output
+spark-warehouse/
+/tmp/ad-fraud-detection/
+
+# Secrets — never commit these
+.env
+*.env
+
+# macOS
+.DS_Store

@@ -19,6 +19,7 @@ Run:
 """
 
 import json
+import os
 import random
 import time
 import uuid
@@ -28,7 +29,9 @@ from faker import Faker
 from kafka import KafkaProducer
 
 # ── Config ────────────────────────────────────────────────────────────────────
-KAFKA_BOOTSTRAP      = "localhost:9092"
+KAFKA_BOOTSTRAP      = "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+CONFLUENT_API_KEY    = os.environ["CONFLUENT_API_KEY"]
+CONFLUENT_API_SECRET = os.environ["CONFLUENT_API_SECRET"]
 TOPIC_IMPRESSIONS    = "ad-impressions"
 TOPIC_CLICKS         = "ad-clicks"
 TOPIC_CONVERSIONS    = "ad-conversions"
@@ -68,6 +71,10 @@ recent_clicks: dict      = {}
 def make_producer() -> KafkaProducer:
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
+        security_protocol="SASL_SSL",
+        sasl_mechanism="PLAIN",
+        sasl_plain_username=CONFLUENT_API_KEY,
+        sasl_plain_password=CONFLUENT_API_SECRET,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         acks="all",
         retries=3,

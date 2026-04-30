@@ -79,20 +79,30 @@ docker ps
 
 ### 2. Install dependencies
 ```bash
-pip install -r requirements.txt
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv sync
 ```
 
-### 3. Start the streaming consumer (Terminal 1)
+### 3. Set Confluent Cloud credentials
+```bash
+export CONFLUENT_API_KEY=your_api_key
+export CONFLUENT_API_SECRET=your_api_secret
+```
+> Get these from Confluent Cloud → API Keys → Create key (scoped to your cluster).
+
+### 4. Start the streaming consumer (Terminal 1)
 ```bash
 python consumer/fraud_detector.py
 ```
 
-### 4. Start the event producer (Terminal 2)
+### 5. Start the event producer (Terminal 2)
 ```bash
 python producer/event_producer.py
 ```
 
-### 5. Query results after ~2 minutes (Terminal 3)
+### 6. Query results after ~2 minutes (Terminal 3)
 ```bash
 python notebooks/query_results.py
 ```
@@ -111,7 +121,8 @@ ad-fraud-detection/
 │   └── fraud_detector.py        # PySpark streaming pipeline
 ├── notebooks/
 │   └── query_results.py         # Query Bronze/Silver/Gold tables
-├── requirements.txt
+├── pyproject.toml
+├── uv.lock
 └── README.md
 ```
 
